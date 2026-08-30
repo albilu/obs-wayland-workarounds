@@ -277,6 +277,7 @@ def load_bindings_from_config():
 
     for path in ini_paths:
         cp = configparser.ConfigParser(interpolation=None)
+        cp.optionxform = str  # preserve case: hotkey names like 'SNOWFALL VISIBILITY TOGGLE' are case-sensitive
         try:
             cp.read(path)
         except Exception as e:
@@ -346,6 +347,37 @@ def ws_trigger_batch(entries):
     if not server_enabled:
         obs.script_log(obs.LOG_ERROR, "[wayland-hotkeys] obs-websocket server DISABLED — Tools → WebSocket Server Settings → Enable")
         return
+
+    def _recv_response(ws, req_id):
+        """Skip event frames (op 5) until the response (op 7) with req_id."""
+        deadline = time.time() + 3
+        while time.time() < deadline:
+            msg = json.loads(ws.recv())
+            if msg.get("op") == 7 and msg.get("d", {}).get("requestId") == req_id:
+                return msg.get("d", {})
+        return {}
+
+    def _trigger(ws, hotkey_name, context):
+        req_data = {"hotkeyName": hotkey_name}
+        if context:
+            req_data["contextName"] = context
+        ws.send(json.dumps({"op": 6, "d": {"requestType": "TriggerHotkeyByName", "requestId": "wh", "requestData": req_data}}))
+        return _recv_response(ws, "wh").get("requestStatus", {})
+
+    def _resolve_advss(ws, old_name):
+        """adv-ss registers condition hotkeys under generated default names
+        ('Macro trigger hotkey N') — the basic.ini save key (macro desc) may
+        not exist at runtime. Remap to the unique runtime condition hotkey."""
+        try:
+            ws.send(json.dumps({"op": 6, "d": {"requestType": "GetHotkeyList", "requestId": "hl"}}))
+            resp = _recv_response(ws, "hl").get("responseData", {}).get("hotkeys", [])
+            cands = [n for n in resp if n.startswith("macro_condition_hotkey_")]
+            if len(cands) == 1:
+                return cands[0]
+        except Exception:
+            pass
+        return None
+
     ws = None
     try:
         with ws_lock:
@@ -359,21 +391,22 @@ def ws_trigger_batch(entries):
                 ws.send(json.dumps({"op": 1, "d": {"rpcVersion": 1, "authentication": proof}}))
                 ws.recv()  # Identified
             for hotkey_name, context in entries:
-                req_data = {"hotkeyName": hotkey_name}
-                if context:
-                    req_data["contextName"] = context
-                ws.send(json.dumps({"op": 6, "d": {"requestType": "TriggerHotkeyByName", "requestId": "wh", "requestData": req_data}}))
-                # Skip event frames (op 5) until the response (op 7) arrives
-                status = {}
-                deadline = time.time() + 3
-                while time.time() < deadline:
-                    msg = json.loads(ws.recv())
-                    if msg.get("op") == 7 and msg.get("d", {}).get("requestId") == "wh":
-                        status = msg.get("d", {}).get("requestStatus", {})
-                        break
+                status = _trigger(ws, hotkey_name, context)
+                # adv-ss condition hotkey: saved name ≠ runtime name → resolve
+                if status.get("code") == 600 and hotkey_name.startswith("macro_condition_hotkey_"):
+                    newname = _resolve_advss(ws, hotkey_name)
+                    if newname and newname != hotkey_name:
+                        with combo_map_lock:
+                            for lst in combo_map.values():
+                                for i, (n, c) in enumerate(lst):
+                                    if n.startswith("macro_condition_hotkey_"):
+                                        lst[i] = (newname, c)
+                        obs.script_log(obs.LOG_INFO, f"[wayland-hotkeys] remapped adv-ss condition hotkey '{hotkey_name}' -> '{newname}'")
+                        hotkey_name = newname
+                        status = _trigger(ws, hotkey_name, context)
                 if log_debug:
                     obs.script_log(obs.LOG_INFO, f"[wayland-hotkeys] ws TriggerHotkeyByName '{hotkey_name}' ctx='{context}' -> {status}")
-                # Self-heal: hotkey no longer registered in this session
+                # Self-heal: hotkey genuinely not registered → drop
                 if status.get("code") == 600:
                     with combo_map_lock:
                         for k, lst in combo_map.items():
