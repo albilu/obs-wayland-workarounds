@@ -235,7 +235,15 @@ def add_binding(combo_map_local, binding_json, hotkey_name, context):
         data = json.loads(binding_json)
     except Exception:
         return
-    for b in data.get("bindings", []):
+    # Two storage formats: basic.ini uses {"bindings":[...]}, scene collection
+    # JSON uses a bare [...] array
+    if isinstance(data, dict):
+        bindings = data.get("bindings", [])
+    elif isinstance(data, list):
+        bindings = data
+    else:
+        return
+    for b in bindings:
         mods = 0
         if b.get("shift"):
             mods |= obs.INTERACT_SHIFT_KEY
@@ -279,20 +287,32 @@ def load_bindings_from_config():
         for name, val in cp.items("Hotkeys"):
             add_binding(new_map, val, name, "")
 
-    # Scene collection (source hotkeys)
-    if collection:
-        sc_path = os.path.join(OBS_CONFIG_DIR, "basic", "scenes", collection + ".json")
-        if os.path.isfile(sc_path):
-            try:
-                with open(sc_path, encoding="utf-8") as f:
-                    sc = json.load(f)
-                for src in sc.get("sources", []):
-                    hk = src.get("hotkeys") or {}
-                    for name, val in hk.items():
-                        if isinstance(val, dict):
-                            add_binding(new_map, json.dumps(val), name, src.get("name", ""))
-            except Exception as e:
-                obs.script_log(obs.LOG_WARNING, f"[wayland-hotkeys] parse {sc_path}: {e}")
+    # Scene collection(s) (source + scene-item hotkeys). global.ini can be
+    # stale (e.g. "Sans nom" while the live collection is CODING.json), so
+    # fall back to merging every collection like we do for profiles.
+    scenes_dir = os.path.join(OBS_CONFIG_DIR, "basic", "scenes")
+    sc_paths = []
+    preferred_sc = os.path.join(scenes_dir, collection + ".json")
+    if collection and os.path.isfile(preferred_sc):
+        sc_paths.append(preferred_sc)
+    else:
+        for p in sorted(glob.glob(os.path.join(scenes_dir, "*.json"))):
+            if p not in sc_paths:
+                sc_paths.append(p)
+
+    for sc_path in sc_paths:
+        try:
+            with open(sc_path, encoding="utf-8") as f:
+                sc = json.load(f)
+            for src in sc.get("sources", []):
+                hk = src.get("hotkeys") or {}
+                for name, val in hk.items():
+                    if isinstance(val, (dict, list)):
+                        # context = owning scene/source name: hotkey names like
+                        # libobs.show_scene_item.N repeat across scenes
+                        add_binding(new_map, json.dumps(val), name, src.get("name", ""))
+        except Exception as e:
+            obs.script_log(obs.LOG_WARNING, f"[wayland-hotkeys] parse {sc_path}: {e}")
 
     with combo_map_lock:
         combo_map.clear()
@@ -317,13 +337,16 @@ def read_ws_config():
     except Exception:
         return 4455, "", True, False
 
-def ws_call(hotkey_name, context):
+def ws_trigger_batch(entries):
+    """Fire a batch of hotkey names over ONE connection, sequentially, in map
+    order (parallel threads race show/hide into random final states)."""
     if not HAS_WS:
         return
     port, password, auth_required, server_enabled = read_ws_config()
     if not server_enabled:
         obs.script_log(obs.LOG_ERROR, "[wayland-hotkeys] obs-websocket server DISABLED — Tools → WebSocket Server Settings → Enable")
         return
+    ws = None
     try:
         with ws_lock:
             ws = websocket.create_connection(f"ws://127.0.0.1:{port}", timeout=3)
@@ -335,16 +358,36 @@ def ws_call(hotkey_name, context):
                 proof = base64.b64encode(hashlib.sha256((secret + auth["challenge"]).encode()).digest()).decode()
                 ws.send(json.dumps({"op": 1, "d": {"rpcVersion": 1, "authentication": proof}}))
                 ws.recv()  # Identified
-            req_data = {"hotkeyName": hotkey_name}
-            if context:
-                req_data["contextName"] = context
-            ws.send(json.dumps({"op": 6, "d": {"requestType": "TriggerHotkeyByName", "requestId": "wh", "requestData": req_data}}))
-            resp = json.loads(ws.recv())
-            ws.close()
-        if log_debug:
-            obs.script_log(obs.LOG_INFO, f"[wayland-hotkeys] ws TriggerHotkeyByName '{hotkey_name}' ctx='{context}' -> {resp.get('d', {}).get('requestStatus', {})}")
+            for hotkey_name, context in entries:
+                req_data = {"hotkeyName": hotkey_name}
+                if context:
+                    req_data["contextName"] = context
+                ws.send(json.dumps({"op": 6, "d": {"requestType": "TriggerHotkeyByName", "requestId": "wh", "requestData": req_data}}))
+                # Skip event frames (op 5) until the response (op 7) arrives
+                status = {}
+                deadline = time.time() + 3
+                while time.time() < deadline:
+                    msg = json.loads(ws.recv())
+                    if msg.get("op") == 7 and msg.get("d", {}).get("requestId") == "wh":
+                        status = msg.get("d", {}).get("requestStatus", {})
+                        break
+                if log_debug:
+                    obs.script_log(obs.LOG_INFO, f"[wayland-hotkeys] ws TriggerHotkeyByName '{hotkey_name}' ctx='{context}' -> {status}")
+                # Self-heal: hotkey no longer registered in this session
+                if status.get("code") == 600:
+                    with combo_map_lock:
+                        for k, lst in combo_map.items():
+                            if (hotkey_name, context) in lst:
+                                lst.remove((hotkey_name, context))
+                    obs.script_log(obs.LOG_INFO, f"[wayland-hotkeys] dropped stale hotkey '{hotkey_name}' (not registered in this session)")
     except Exception as e:
-        obs.script_log(obs.LOG_WARNING, f"[wayland-hotkeys] ws failed for '{hotkey_name}': {e}")
+        obs.script_log(obs.LOG_WARNING, f"[wayland-hotkeys] ws failed: {e}")
+    finally:
+        if ws is not None:
+            try:
+                ws.close()
+            except Exception:
+                pass
 
 def trigger_hotkeys(obs_key, mods):
     """Fire bindings matching key+modifiers (exact, then non-strict subset)."""
@@ -359,10 +402,11 @@ def trigger_hotkeys(obs_key, mods):
         if log_debug:
             obs.script_log(obs.LOG_INFO, f"[wayland-hotkeys] no binding for key={obs_key} mods={mods}")
         return False
-    for name, context in entries:
-        threading.Thread(target=ws_call, args=(name, context), daemon=True).start()
-        if log_debug:
+    if log_debug:
+        for name, context in entries:
             obs.script_log(obs.LOG_INFO, f"[wayland-hotkeys] press '{name}' ctx='{context}' mods={mods}")
+    # Sequential batch: parallel calls race (show/hide order nondeterministic)
+    threading.Thread(target=ws_trigger_batch, args=(entries,), daemon=True).start()
     return True
 
 def is_keyboard_device(dev):
